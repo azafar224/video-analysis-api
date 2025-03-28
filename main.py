@@ -1,72 +1,95 @@
-from fastapi import FastAPI, File, UploadFile, HTTPException
-import google.generativeai as genai
 import os
 import time
+import concurrent.futures
+import google.generativeai as genai
+from flask import Flask, request, jsonify
 
-app = FastAPI()
-
-# Configure Google Gemini API
-genai.configure(api_key="AIzaSyBfLy0FDAKNvMBsvC7hf1_U8sEmqMvk2X8")
+# Configure Gemini API
+genai.configure(api_key=os.getenv("AIzaSyBfLy0FDAKNvMBsvC7hf1_U8sEmqMvk2X8"))  # Store API key in environment variables
 model = genai.GenerativeModel("gemini-2.0-flash-lite")
 
 # Constants
-UPLOAD_FOLDER = "uploads"
-MAX_FILE_SIZE = 100 * 1024 * 1024  # 100 MB in bytes
-MAX_RETRIES = 30  # Max attempts to check upload status
-WAIT_TIME = 5  # Wait time between attempts
+UPLOAD_FOLDER = "/tmp/uploads"  # Use /tmp to avoid read-only file system issues
+MAX_FILE_SIZE = 100 * 1024 * 1024  # 100MB
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)  # Ensure upload folder exists
 
-# Create an uploads folder
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+app = Flask(__name__)
 
-def check_file_size(file_size: int):
-    """Ensure file size is within the allowed limit."""
-    if file_size > MAX_FILE_SIZE:
-        raise HTTPException(status_code=413, detail="File size exceeds 100MB limit.")
+def check_file_size(file_path):
+    """Check file size and warn if it exceeds the 100MB limit."""
+    size = os.path.getsize(file_path)
+    if size > MAX_FILE_SIZE:
+        print(f"Warning: {file_path} is {size / (1024 * 1024):.2f} MB, exceeding the 100MB limit.")
+    return size
 
-def wait_for_video_ready(video, retries=MAX_RETRIES, wait_time=WAIT_TIME):
-    """Wait until the uploaded video is marked as 'READY'."""
-    for attempt in range(retries):
-        status = video.state
-        print(f"⏳ Checking upload status (Attempt {attempt+1}): {status}")
-
-        if status == "ACTIVE" or status == 2:
-            print("✅ Video is ready for analysis!")
-            return True
-        
-        time.sleep(wait_time)
-    
-    raise HTTPException(status_code=500, detail="Video did not become ready in time.")
-
-@app.post("/analyze-video/")
-async def analyze_video(file: UploadFile = File(...)):
-    """Handles video upload, waits for readiness, then analyzes it."""
-    video_path = os.path.join(UPLOAD_FOLDER, file.filename)
-
-    # Check file size before saving
-    check_file_size(file.size)
-
-    # Save the uploaded file
-    with open(video_path, "wb") as buffer:
-        buffer.write(await file.read())
-
-    print(f"✅ Video saved: {video_path}")
-
-    # Upload video to Gemini AI
+def upload_video(video_path):
+    """Upload video to Gemini AI and wait for it to be ready."""
+    print(f"🚀 Uploading {video_path}...")
     video = genai.upload_file(video_path)
 
-    # Wait for the video to be ready
-    wait_for_video_ready(video)
+    for _ in range(30):  # Max 30 attempts
+        status = video.state
+        print(f"⏳ Status: {status}")
 
-    # Generate structured analysis
-    response = model.generate_content([
-        {"file": video},
-        {"text": "Analyze this video and provide structured output in the format:\n"
-                 "Engagement Score: [score out of 10]\n"
-                 "Hook Score: [score out of 10]\n"
-                 "Strengths:\n- [point1]\n- [point2]\n"
-                 "Weaknesses:\n- [point1]\n- [point2]\n"
-                 "Suggestions for Improvement:\n- [point1]\n- [point2]\n"
-                 "Ensure no section is repeated."}
-    ])
+        if status in ["ACTIVE", 2]:
+            print(f"✅ {video_path} is ready!")
+            return video
 
-    return {"analysis": response.text}
+        time.sleep(5)  # Wait before retrying
+
+    raise RuntimeError(f"❌ {video_path} did not become ready in time.")
+
+def analyze_videos(video_paths):
+    """Uploads videos and generates an analysis using Gemini AI."""
+    uploaded_videos = {}
+    
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        future_to_path = {executor.submit(upload_video, path): path for path in video_paths}
+        for future in concurrent.futures.as_completed(future_to_path):
+            path = future_to_path[future]
+            try:
+                uploaded_videos[path] = future.result()
+            except Exception as exc:
+                print(f"Error uploading {path}: {exc}")
+    
+    if len(uploaded_videos) != len(video_paths):
+        return "Error: Some videos failed to upload."
+
+    # Create prompt for Gemini AI
+    prompt_lines = [
+        "Analyze and compare the following videos:",
+        "Provide structured feedback:",
+        "Video [n] Engagement Score: [score]",
+        "Video [n] Hook Score: [score]",
+        "Strengths:\n- [point1]\n- [point2]",
+        "Weaknesses:\n- [point1]\n- [point2]",
+        "Suggestions:\n- [suggestion1]\n- [suggestion2]",
+    ]
+    
+    # Add video references to the prompt
+    for path in video_paths:
+        prompt_lines.append(str(uploaded_videos[path]))  # Convert video object to string
+    
+    response = model.generate_content(prompt_lines)
+    return response.text
+
+@app.route("/upload", methods=["POST"])
+def upload():
+    """Handle video file upload and analysis."""
+    if "video" not in request.files:
+        return jsonify({"error": "No file provided"}), 400
+    
+    file = request.files["video"]
+    
+    # Ensure file does not exceed size limit
+    file_path = os.path.join(UPLOAD_FOLDER, file.filename)
+    file.save(file_path)
+    check_file_size(file_path)
+
+    # Perform analysis
+    result = analyze_videos([file_path])
+
+    return jsonify({"analysis": result})
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=8000)
